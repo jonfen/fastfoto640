@@ -3,11 +3,18 @@
 # Copyright (C) 2026 Paul Barros
 """FastFoto Scan - a small scanning app for the Epson FastFoto FF-640 on Linux.
 
-Watches the feeder, starts scanning by itself when bills are loaded, crops and
-straightens each side, and drops the pair into an output folder as
-    FastFoto_00001.jpg  (front)
-    FastFoto_00001_b.jpg  (back)
-which is the naming Dollar Detective's Monitor mode already pairs.
+Watches the feeder, starts scanning by itself when photos or bills are loaded,
+crops and straightens each side, and drops the pair into an output folder as
+    fronts/00001f.jpg               FastFoto_00001.jpg  (front)
+    backs/00001b.jpg        or      FastFoto_00001_b.jpg  (back)
+Photos get the first naming, fronts and backs each in a folder of their own,
+so the fronts can be looked through (or uploaded) without the backs in
+between. The second, all in the one folder, is what Dollar Detective's
+Monitor mode already pairs.
+
+For photos it can also turn each one the right way up
+(orient.py), and read the handwriting on the back and store it, with the date,
+in the files (fastfoto_enrich.py).
 
 Scanning talks to the scanner directly over USB (esci2.py, the ESC/I-2
 protocol) instead of through SANE, because SANE's epsonds backend never asks
@@ -25,13 +32,17 @@ import time
 import tkinter as tk
 import traceback
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import cv2
 from PIL import Image, ImageTk
 
 import esci2
-from billcrop import crop_item
+import handwriting
+import metadata
+import orient
+from billcrop import crop_item, crop_pair
+from fastfoto_enrich import Enricher, find_photos, photo_paths
 
 VENDOR, PRODUCT = 0x04B8, 0x015F
 CONFIG_PATH = Path.home() / ".config" / "fastfoto640" / "settings.json"
@@ -45,16 +56,35 @@ def log(msg: str):
             f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg.rstrip() + "\n")
     except OSError:
         pass
-PREFIX = "FastFoto_"
-NAME_RE = re.compile(rf"^{PREFIX}(\d+)(_b)?\.jpg$", re.IGNORECASE)
-# Longest page we accept along the feed direction. A bill fed long-edge-first
-# is 66 mm, plus overscan (about 11 mm each end) and room for a crooked feed.
+
+
+# File naming, as shown in the app -> the "naming" setting.
+NAMINGS = {"00001f.jpg / 00001b.jpg": "photo",
+           "FastFoto_00001.jpg / _b.jpg": "fastfoto"}
+# Longest page we accept along the feed direction when scanning bills. A bill
+# fed long-edge-first is 66 mm, plus overscan (about 11 mm each end) and room
+# for a crooked feed. Photos get the scanner's full length instead.
 # (With overscan on, the FF-640 ignores this and pads every page to 14 inches;
 # that's why pages are transferred as JPEG, where the padding is nearly free.)
-SCAN_LENGTH_MM = 120
+BILL_SCAN_LENGTH_MM = 120
 # Background kept around the bill, in pixels at 300 dpi (scaled for 600).
 MARGINS = {"Tight": 0, "Normal": 6, "Loose": 16}
 SETTLE_SECONDS = 1.5     # wait after paper appears, so a stack can be squared up
+
+
+def scan_length_px(settings: dict, dpi: int):
+    """Longest page to accept, in pixels; None means all the scanner can do.
+    The "scan_length_mm" setting overrides the choice made from the naming."""
+    mm = settings.get("scan_length_mm")
+    if not mm and settings.get("naming") != "photo":
+        mm = BILL_SCAN_LENGTH_MM
+    return int(mm / 25.4 * dpi) if mm else None
+
+
+def items(settings: dict, n: int = 2) -> str:
+    """What is being scanned, for messages: 'photo(s)' or 'bill(s)'."""
+    word = "photo" if settings.get("naming") == "photo" else "bill"
+    return word if n == 1 else word + "s"
 
 
 # --------------------------------------------------------------------------- #
@@ -74,14 +104,25 @@ def dollar_detective_folder() -> Path:
     return Path.home() / "DollarDetective"
 
 
+def dollar_detective_installed() -> bool:
+    return (Path.home() / ".config" / "DollarDetective" / "user_settings.yaml").exists()
+
+
 def load_settings() -> dict:
+    # Without Dollar Detective this is a photo scanner: photo file names, and
+    # photos turned upright. Reading handwriting sends images to Google, so
+    # it stays off until it is switched on.
+    photos = not dollar_detective_installed()
     s = {"output_dir": str(dollar_detective_folder()), "dpi": 300,
          "duplex": True, "auto_start": True, "counter": 0, "jpeg_quality": 95,
-         "margin": "Normal"}
+         "margin": "Normal", "naming": "photo" if photos else "fastfoto",
+         "auto_rotate": photos, "read_handwriting": False, "map_places": True}
     try:
         s.update(json.loads(CONFIG_PATH.read_text()))
     except (OSError, ValueError):
         pass
+    if s["naming"] not in NAMINGS.values():
+        s["naming"] = "photo"
     return s
 
 
@@ -204,20 +245,28 @@ class Scanner(threading.Thread):
     """Background thread: waits for paper, scans with the direct ESC/I-2
     driver (esci2.py, with overscan so no edge is lost), and hands each page
     to a second thread that crops and writes it (so cropping never makes the
-    feeder wait). Talks to the GUI only through `events`."""
+    feeder wait). Saved photos are passed on to `enricher`, a third thread
+    that adds captions and dates. Talks to the GUI only through `events`."""
 
-    def __init__(self, settings: dict, events: queue.Queue):
+    def __init__(self, settings: dict, events: queue.Queue, enricher=None):
         super().__init__(daemon=True)
         self.settings = settings
         self.events = events
+        self.enricher = enricher
         self.scan_now = threading.Event()
         self.stop_scan = threading.Event()
         self.quit = threading.Event()
+        self._warned = set()
 
     def emit(self, kind, payload=None):
         if kind in ("warn", "error"):
             log(f"{kind}: {payload}")
         self.events.put((kind, payload))
+
+    def warn_once(self, text):
+        if text not in self._warned:
+            self._warned.add(text)
+            self.emit("warn", text)
 
     def crashed(self, where):
         tb = traceback.format_exc()
@@ -284,14 +333,14 @@ class Scanner(threading.Thread):
             with esci2.FF640() as dev:
                 for side, img in dev.scan(
                         dpi=dpi, duplex=bool(s["duplex"]), overscan=True,
-                        max_len_px=int(SCAN_LENGTH_MM / 25.4 * dpi),
+                        max_len_px=scan_length_px(s, dpi),
                         jpeg_quality=s.get("scanner_jpeg_quality", 95),
                         stop=self.stop_scan):
                     pages += 1
                     pages_q.put((pages, side, img))
         except esci2.ScanError as e:
             if e.cause == "PJ" and pages == 0:
-                err = "no bills in the feeder"
+                err = f"no {items(s)} in the feeder"
             elif e.cause == "PJ":
                 err = "paper jam - check the scanner"
             else:
@@ -311,88 +360,123 @@ class Scanner(threading.Thread):
         self.emit("done", (result["bills"], secs))
 
     def _process_pages(self, pages_q, out_dir, result):
-        """Crop, pair each front (side A) with its back (side B), and write.
+        """Pair each front (side A) with its back (side B), crop, and write.
         Runs alongside the scanning.
 
         Both sides of a bill are scanned at the same time, and the scanner
         doesn't always finish sending the front first, so sides are paired by
-        position: the nth front goes with the nth back."""
+        position: the nth front goes with the nth back. The two sides are
+        cropped together, because each is a check on the other."""
         s = self.settings
-        fronts, backs = [], []
+        fronts, backs = [], []      # uncropped pages waiting for their other side
         while True:
             item = pages_q.get()
             if item is None:
                 break
             page, side, img = item
             try:
-                cropped = self._crop(page, img)
+                self._keep_raw(page, img)
                 if not s["duplex"]:
-                    self._save_bill(out_dir, result, cropped, None)
+                    front, notes = self._crop(img)
+                    self._save_bill(out_dir, result, front, None, notes)
                     continue
-                (backs if side == "B" else fronts).append(cropped)
+                (backs if side == "B" else fronts).append(img)
                 while fronts and backs:
-                    self._save_bill(out_dir, result, fronts.pop(0), backs.pop(0))
+                    front, back, notes = self._crop_pair(fronts.pop(0), backs.pop(0))
+                    self._save_bill(out_dir, result, front, back, notes)
             except Exception:
                 self.crashed(f"page {page}")
         try:
-            for front in fronts:
-                n = self._save_bill(out_dir, result, front, None)
-                self.emit("warn", f"Bill {n:05d} has no back image (scan stopped mid-bill)")
+            for img in fronts:
+                front, notes = self._crop(img)
+                n = self._save_bill(out_dir, result, front, None, notes)
+                self.emit("warn", f"{items(s, 1).capitalize()} {n:05d} has no back image "
+                                  f"(scan stopped mid-{items(s, 1)})")
             if backs:
                 self.emit("warn", f"{len(backs)} back image(s) without a front were skipped")
         except Exception:
             self.crashed("last page")
 
-    def _crop(self, page, img):
-        s = self.settings
-        raw_dir = s.get("keep_raw_dir")   # debugging: keep uncropped scans
+    def _keep_raw(self, page, img):
+        raw_dir = self.settings.get("keep_raw_dir")   # debugging: keep uncropped scans
         if raw_dir:
             Path(raw_dir).mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(Path(raw_dir) / time.strftime(f"raw_%H%M%S_p{page:03d}.png")), img)
-        margin = MARGINS.get(s.get("margin"), 6) * int(s["dpi"]) // 300
-        try:
-            cropped, found = crop_item(img, margin_px=margin)
-        except Exception as e:
-            log(f"crop crash on page {page}:\n{traceback.format_exc()}")
-            self.emit("warn", f"Page {page}: crop failed ({e}); kept the full scan")
-            return img
-        if not found:
-            self.emit("warn", f"Page {page}: couldn't find the bill edges; kept the full scan")
-        return cropped
 
-    def _save_bill(self, out_dir, result, front, back):
+    def _margin(self):
+        s = self.settings
+        return MARGINS.get(s.get("margin"), 6) * int(s["dpi"]) // 300
+
+    def _crop(self, img):
+        """Crop a page that has no other side. Returns (image, notes): notes
+        says, in plain words, anything about the crop that deserves a look."""
+        try:
+            cropped, found = crop_item(img, margin_px=self._margin())
+        except Exception as e:
+            log(f"crop crash:\n{traceback.format_exc()}")
+            return img, [f"crop failed ({e}), kept the full scan"]
+        return cropped, [] if found else ["couldn't find the edges, kept the full scan"]
+
+    def _crop_pair(self, front, back):
+        """Crop the two sides of one sheet. Returns (front, back, notes)."""
+        try:
+            return crop_pair(front, back, margin_px=self._margin())
+        except Exception as e:
+            log(f"crop crash:\n{traceback.format_exc()}")
+            return front, back, [f"crop failed ({e}), kept the full scans"]
+
+    def _upright(self, front, back):
+        """Turn both sides so the front is the right way up. Whatever
+        goes wrong here, the scan itself is kept, just not turned."""
+        try:
+            return orient.upright_pair(front, back)
+        except orient.OrientError as e:
+            self.warn_once(f"Photos are not being rotated: {e}")
+        except Exception:
+            log(f"rotation crash:\n{traceback.format_exc()}")
+            self.warn_once(f"Photos are not being rotated: internal error (details in {LOG_PATH})")
+        return front, back, None
+
+    def _save_bill(self, out_dir, result, front, back, crop_notes=()):
+        s = self.settings
+        turned = None
+        if s.get("auto_rotate"):
+            front, back, turned = self._upright(front, back)
         n = self._next_number(out_dir)
-        self._write(out_dir, f"{PREFIX}{n:05d}.jpg", front)
+        for note in crop_notes:
+            self.emit("warn", f"{items(s, 1).capitalize()} {n:05d}: {note}")
+        front_path, back_path = photo_paths(out_dir, s["naming"], n)
+        saved = self._write(front_path, front)
         if back is not None:
-            self._write(out_dir, f"{PREFIX}{n:05d}_b.jpg", back)
+            saved = self._write(back_path, back) and saved
         result["bills"] += 1
         self.emit("bill", (result["bills"], front))
+        if saved and self.enricher and (s.get("auto_rotate") or s.get("read_handwriting")):
+            self.enricher.submit(out_dir, n, front_path,
+                                 back_path if back is not None else None,
+                                 turned, list(crop_notes))
         return n
 
     def _next_number(self, out_dir: Path) -> int:
-        highest = self.settings.get("counter", 0)
-        try:
-            for name in os.listdir(out_dir):
-                m = NAME_RE.match(name)
-                if m:
-                    highest = max(highest, int(m.group(1)))
-        except OSError:
-            pass
+        # Either naming counts, and so do fronts/ and backs/.
+        highest = max([self.settings.get("counter", 0), *find_photos(out_dir)])
         self.settings["counter"] = highest + 1
         save_settings(self.settings)
         return highest + 1
 
-    def _write(self, out_dir: Path, name: str, img):
+    def _write(self, path: Path, img):
         # Write under a hidden temp name, then rename, so a folder watcher
         # never sees a half-written JPEG.
-        tmp = out_dir / f".{name}.part"
+        tmp = path.with_name(f".{path.name}.part")
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY,
                                              int(self.settings["jpeg_quality"])])
         if not ok:
-            self.emit("error", f"Couldn't encode {name}")
-            return
+            self.emit("error", f"Couldn't encode {path.name}")
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_bytes(buf.tobytes())
-        os.replace(tmp, out_dir / name)
+        os.replace(tmp, path)
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -400,12 +484,14 @@ class Scanner(threading.Thread):
 # --------------------------------------------------------------------------- #
 
 class App:
-    FEEDER_TEXT = {
-        "missing": "Scanner not found - is it plugged in and switched on?",
-        "empty": "Ready - load bills face down to start",
-        "loaded": "Bills loaded",
-        "busy": "Scanner busy",
-    }
+    def feeder_text(self, status):
+        what = items(self.settings)
+        return {
+            "missing": "Scanner not found - is it plugged in and switched on?",
+            "empty": f"Ready - load {what} face down to start",
+            "loaded": f"{what.capitalize()} loaded",
+            "busy": "Scanner busy",
+        }.get(status, status)
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -413,10 +499,12 @@ class App:
         self.events = queue.Queue()
         self.session_bills = 0
         self.scanning = False
+        self.feeder = None
         self._thumb = None
+        self._told = set()       # setup notices already shown
 
         root.title("FastFoto Scan")
-        root.minsize(520, 460)
+        root.minsize(520, 530)
         pad = {"padx": 10, "pady": 4}
 
         # Output folder
@@ -452,10 +540,34 @@ class App:
         o2 = ttk.Frame(root)
         o2.pack(fill="x", **pad)
         self.auto_var = tk.BooleanVar(value=self.settings["auto_start"])
-        ttk.Checkbutton(o2, text="Start automatically when bills are loaded",
+        ttk.Checkbutton(o2, text="Start automatically when loaded",
                         variable=self.auto_var,
                         command=lambda: self.update_setting("auto_start", self.auto_var.get())
                         ).pack(side="left")
+        ttk.Label(o2, text="File names:").pack(side="left", padx=(12, 0))
+        shown = {v: k for k, v in NAMINGS.items()}
+        self.naming_var = tk.StringVar(value=shown[self.settings["naming"]])
+        n = ttk.Combobox(o2, textvariable=self.naming_var, values=list(NAMINGS),
+                         state="readonly", width=26)
+        n.pack(side="left", padx=4)
+        n.bind("<<ComboboxSelected>>", lambda _e: self.set_naming())
+
+        # Photo options
+        o3 = ttk.Frame(root)
+        o3.pack(fill="x", **pad)
+        self.rotate_var = tk.BooleanVar(value=bool(self.settings["auto_rotate"]))
+        ttk.Checkbutton(o3, text="Turn photos upright", variable=self.rotate_var,
+                        command=self.set_photo_options).pack(side="left")
+        self.read_var = tk.BooleanVar(value=bool(self.settings["read_handwriting"]))
+        ttk.Checkbutton(o3, text="Read handwriting on backs", variable=self.read_var,
+                        command=self.set_photo_options).pack(side="left", padx=12)
+        # Places come from the handwriting, so this goes with the box before it.
+        self.places_var = tk.BooleanVar(value=bool(self.settings["map_places"]))
+        self.places_box = ttk.Checkbutton(o3, text="Put places on the map",
+                                          variable=self.places_var,
+                                          command=self.set_photo_options)
+        self.places_box.pack(side="left")
+        self.places_box.state(["!disabled" if self.read_var.get() else "disabled"])
 
         # Buttons
         b = ttk.Frame(root)
@@ -464,21 +576,27 @@ class App:
         self.scan_btn.pack(side="left")
         self.stop_btn = ttk.Button(b, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=6)
-        self.count_var = tk.StringVar(value="0 bills this session")
+        self.count_var = tk.StringVar()
         ttk.Label(b, textvariable=self.count_var, font=("TkDefaultFont", 11, "bold")
                   ).pack(side="right")
+        self.show_count()
 
-        # Status + preview + log
+        # Status + caption progress + preview + log
         self.status_var = tk.StringVar(value="Looking for scanner…")
         ttk.Label(root, textvariable=self.status_var, font=("TkDefaultFont", 12)
                   ).pack(fill="x", **pad)
+        self.caption_var = tk.StringVar()
+        ttk.Label(root, textvariable=self.caption_var).pack(fill="x", **pad)
         self.preview = ttk.Label(root, anchor="center")
         self.preview.pack(fill="both", expand=True, **pad)
         self.log = tk.Text(root, height=5, state="disabled", wrap="word")
         self.log.pack(fill="x", **pad)
 
-        self.worker = Scanner(self.settings, self.events)
+        self.enricher = Enricher(self.settings, lambda kind, payload: self.events.put((kind, payload)))
+        self.enricher.start()
+        self.worker = Scanner(self.settings, self.events, self.enricher)
         self.worker.start()
+        self.check_photo_setup()
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(100, self.poll)
 
@@ -486,6 +604,64 @@ class App:
     def update_setting(self, key, value):
         self.settings[key] = value
         save_settings(self.settings)
+
+    def set_naming(self):
+        self.update_setting("naming", NAMINGS[self.naming_var.get()])
+        self.show_count()
+        if not self.scanning and self.feeder:
+            self.status_var.set(self.feeder_text(self.feeder))
+
+    def set_photo_options(self):
+        self.update_setting("auto_rotate", self.rotate_var.get())
+        self.update_setting("read_handwriting", self.read_var.get())
+        self.update_setting("map_places", self.places_var.get())
+        self.places_box.state(["!disabled" if self.read_var.get() else "disabled"])
+        self.check_photo_setup()
+
+    def check_photo_setup(self):
+        """Say up front what a ticked photo option still needs, rather than
+        after a stack has been scanned."""
+        s = self.settings
+        needs = []
+        missing = orient.missing_models() if s["auto_rotate"] else []
+        if len(missing) > 1:
+            needs.append("Turning photos upright needs its models: run ./install.sh again.")
+        elif missing == ["scene"]:
+            needs.append("Photos with no faces in them won't be turned upright until the "
+                         "scene model is downloaded: run ./install.sh again.")
+        elif missing:
+            needs.append("Photos are being turned upright without the face model, which is "
+                         "a check on the turning: run ./install.sh again.")
+        if s["read_handwriting"]:
+            problem = handwriting.setup_problem(fetch_key=False)
+            if problem:
+                needs.append(f"Reading handwriting isn't set up: {problem}.")
+            else:
+                needs.append("The back of each photo will be sent to Google's Gemini to be read"
+                             + (", unless it is blank." if s.get("skip_blank_backs", True)
+                                else "."))
+                # A key kept in 1Password is fetched now, off the window's
+                # thread, so its approval prompt comes before the first scan.
+                threading.Thread(target=self.fetch_key, daemon=True).start()
+                if s["map_places"]:
+                    needs.append("A place named on a back will be looked up with OpenStreetMap, "
+                                 "to put the photo on the map. Only the place's name is sent.")
+        if (s["auto_rotate"] or s["read_handwriting"]) and not metadata.find_exiftool(s):
+            needs.append("Captions and dates can't be written into the files until "
+                         "exiftool is installed: sudo apt install libimage-exiftool-perl")
+        for text in needs:
+            if text not in self._told:
+                self._told.add(text)
+                self.add_log(text)
+
+    def fetch_key(self):
+        problem = handwriting.setup_problem()
+        if problem:
+            self.events.put(("warn", f"Reading handwriting isn't set up: {problem}."))
+
+    def show_count(self):
+        n = self.session_bills
+        self.count_var.set(f"{n} {items(self.settings, n)} this session")
 
     def browse(self):
         d = filedialog.askdirectory(initialdir=self.dir_var.get() or str(Path.home()))
@@ -500,6 +676,12 @@ class App:
         self.worker.cancel()
 
     def close(self):
+        waiting = self.enricher.waiting()
+        if waiting and not messagebox.askokcancel(
+                "FastFoto Scan",
+                f"{waiting} photo(s) are still waiting for their caption and date.\n\n"
+                "Quit anyway? Running fastfoto-enrich later finishes them."):
+            return
         self.stop()
         self.worker.quit.set()
         self.worker.scan_now.set()
@@ -525,8 +707,10 @@ class App:
         self.root.after(100, self.poll)
 
     def handle(self, kind, payload):
-        if kind == "feeder" and not self.scanning:
-            self.status_var.set(self.FEEDER_TEXT.get(payload, payload))
+        if kind == "feeder":
+            self.feeder = payload
+            if not self.scanning:
+                self.status_var.set(self.feeder_text(payload))
         elif kind == "scanning":
             self.scanning = True
             self.scan_btn.configure(state="disabled")
@@ -535,25 +719,56 @@ class App:
         elif kind == "bill":
             n, img = payload
             self.session_bills += 1
-            self.count_var.set(f"{self.session_bills} bill{'s' if self.session_bills != 1 else ''} this session")
+            self.show_count()
             self.status_var.set(f"Scanning… {n} in this stack")
             self.show(img)
+            self.show_captions()
         elif kind == "done":
             bills, secs = payload
             self.scanning = False
             self.scan_btn.configure(state="normal")
             self.stop_btn.configure(state="disabled")
-            rate = f" ({secs / bills:.1f} s per bill)" if bills else ""
+            what, one = items(self.settings, bills), items(self.settings, 1)
+            rate = f" ({secs / bills:.1f} s per {one})" if bills else ""
             if not bills:
                 return   # keep the error message on screen
-            self.status_var.set(f"Stack done: {bills} bills in {secs:.0f} s{rate}. Load more to continue.")
+            self.status_var.set(f"Stack done: {bills} {what} in {secs:.0f} s{rate}. Load more to continue.")
             if bills:
-                self.add_log(f"Stack done: {bills} bills{rate} -> {self.settings['output_dir']}")
+                self.add_log(f"Stack done: {bills} {what}{rate} -> {self.settings['output_dir']}")
+        elif kind == "caption":
+            self.show_captions(payload)
         elif kind == "warn":
             self.add_log("Warning: " + payload)
         elif kind == "error":
             self.add_log("Error: " + payload)
             self.status_var.set(payload)
+
+    def show_captions(self, row=None):
+        """The caption progress line, and a log line for each caption found."""
+        e = self.enricher
+        waiting = e.waiting()
+        if not (waiting or e.done or e.failed):
+            return                    # no photo options in use
+        parts = [f"{e.done} done"]
+        if waiting:
+            parts.append(f"{waiting} waiting")
+        if e.failed:
+            parts.append(f"{e.failed} failed")
+        self.caption_var.set("Captions and dates: " + ", ".join(parts))
+        for note in (row["notes"].split("; ") if row else []):
+            if note.startswith("rotation:"):         # which way up needs a look
+                self.add_log(f"{row['number']}: {note.split(':', 1)[1].strip()}")
+        if row and (row["handwritten_text"] or row["date_applied"]):
+            text = " / ".join(row["handwritten_text"].split("\n"))
+            date = f" ({row['date_applied']})" if row["date_applied"] else ""
+            self.add_log(f"{row['number']}: {text}{date}")
+            if row.get("place_found"):       # "name -> what it matched (position)"
+                where = row["place_found"].split(" -> ", 1)[-1].rsplit(" (", 1)[0]
+                self.add_log(f"{row['number']}: on the map at {where}")
+            elif row.get("place"):
+                self.add_log(f"{row['number']}: place \"{row['place']}\" (not on the map)")
+        elif row and "back: looks blank" in row["notes"]:
+            self.add_log(f"{row['number']}: the back is blank, so it wasn't sent for reading")
 
     def show(self, bgr):
         w = max(200, self.preview.winfo_width() - 10)

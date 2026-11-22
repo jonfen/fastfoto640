@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install FastFoto Scan for the current user:
 #   - Python virtualenv with the dependencies
+#   - the two models for turning photos upright (about 77 MB)
 #   - udev rule so the scanner can be used without root (asks for sudo)
 #   - app-menu entry
 set -e
@@ -13,6 +14,16 @@ fi
 
 python3 -m venv "$here/venv"
 "$here/venv/bin/pip" install -q -r "$here/requirements.txt"
+
+# Photo features. Scanning works without them, so neither stops the install.
+if ! "$here/venv/bin/python" "$here/orient.py" --fetch-models; then
+    echo "Note: not every photo will be turned upright until both models for it are"
+    echo "      downloaded; run ./install.sh again when you are online."
+fi
+if ! command -v exiftool >/dev/null 2>&1; then
+    echo "Note: exiftool is missing, so captions and dates can't be written into photos."
+    echo "      On Debian/Ubuntu: sudo apt install libimage-exiftool-perl"
+fi
 
 if [ ! -f /etc/udev/rules.d/60-epson-ff640.rules ]; then
     echo "Installing udev rule (needs sudo)..."
